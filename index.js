@@ -27,19 +27,27 @@ if (!admin.apps.length) {
 const db = admin.firestore();
 
 // ---------- Config ----------
-// AI provider: add ONE of these as a variable on Railway.
+// AI provider: add ONE of these keys as a variable on Railway.
+//   GROQ_API_KEY      -> free tier from console.groq.com (no card needed)
 //   GEMINI_API_KEY    -> free tier from Google AI Studio (no card needed)
 //   ANTHROPIC_API_KEY -> Claude (paid, needs a card)
-// If both are set, Claude is used.
+// If several are set, the first one in this order is used: Claude, Groq, Gemini.
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || "";
+const GROQ_API_KEY = process.env.GROQ_API_KEY || "";
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
-const PROVIDER = ANTHROPIC_API_KEY ? "claude" : GEMINI_API_KEY ? "gemini" : "";
+const PROVIDER = ANTHROPIC_API_KEY
+  ? "claude"
+  : GROQ_API_KEY
+  ? "groq"
+  : GEMINI_API_KEY
+  ? "gemini"
+  : "";
 if (!PROVIDER) {
-  console.error("Missing GEMINI_API_KEY (free) or ANTHROPIC_API_KEY env var.");
+  console.error("Missing GROQ_API_KEY or GEMINI_API_KEY (both free) or ANTHROPIC_API_KEY env var.");
   process.exit(1);
 }
 console.log(`AI provider: ${PROVIDER}`);
-console.log("Bot version: v6 (quota handling, AUTO_REPLY switch)");
+console.log("Bot version: v7 (Groq support)");
 
 // Assign the groups the bot works in: ALLOWED_GROUP_JID = one or more group IDs,
 // separated by commas, e.g. 120363422587335833@g.us,120363408932063696@g.us
@@ -87,14 +95,16 @@ async function loadDynamicGroups() {
 // Models: MAIN_MODEL writes recaps and answers when someone calls the bot (tag / "catch me up").
 // FAST_MODEL answers unprompted questions. Free-tier daily quotas are counted per model,
 // so using two different models gives you two separate daily allowances.
-const MAIN_MODEL =
-  process.env.MAIN_MODEL ||
-  (PROVIDER === "claude" ? "claude-sonnet-4-6" : "gemini-3.6-flash");
-const FAST_MODEL =
-  process.env.FAST_MODEL ||
-  (PROVIDER === "claude" ? "claude-haiku-4-5-20251001" : "gemini-3.6-flash");
+// If you set MAIN_MODEL / FAST_MODEL in Railway, the names must belong to the provider in use.
+const DEFAULT_MODELS = {
+  claude: ["claude-sonnet-4-6", "claude-haiku-4-5-20251001"],
+  groq: ["openai/gpt-oss-120b", "openai/gpt-oss-20b"],
+  gemini: ["gemini-3.6-flash", "gemini-3.6-flash"],
+};
+const MAIN_MODEL = process.env.MAIN_MODEL || DEFAULT_MODELS[PROVIDER][0];
+const FAST_MODEL = process.env.FAST_MODEL || DEFAULT_MODELS[PROVIDER][1];
 
-const HISTORY_LIMIT = Number(process.env.HISTORY_LIMIT || 300); // messages sent to Claude
+const HISTORY_LIMIT = Number(process.env.HISTORY_LIMIT || (PROVIDER === "groq" ? 120 : 300)); // messages sent to the AI
 const HISTORY_HOURS = Number(process.env.HISTORY_HOURS || 48); // ignore older than this
 // Set AUTO_REPLY=off in Railway to answer ONLY when the bot is tagged or asked for a recap
 // (saves your free AI quota). Default: on.
@@ -137,11 +147,41 @@ function isExplicitlyCalled(msg, text, sock) {
   return false;
 }
 
-// ---------- AI API (Gemini free tier or Claude) ----------
+// ---------- AI API (Groq / Gemini free tiers, or Claude) ----------
 async function callAI({ model, system, prompt, maxTokens = 800 }) {
-  return PROVIDER === "gemini"
-    ? callGemini({ model, system, prompt, maxTokens })
-    : callClaudeApi({ model, system, prompt, maxTokens });
+  if (PROVIDER === "groq") return callGroq({ model, system, prompt, maxTokens });
+  if (PROVIDER === "gemini") return callGemini({ model, system, prompt, maxTokens });
+  return callClaudeApi({ model, system, prompt, maxTokens });
+}
+
+async function callGroq({ model, system, prompt, maxTokens }) {
+  const body = {
+    model,
+    messages: [
+      { role: "system", content: system },
+      { role: "user", content: prompt },
+    ],
+    // reasoning models spend part of this budget on thinking, so leave room
+    max_completion_tokens: Math.max(maxTokens * 3, 1024),
+  };
+  if (model.includes("gpt-oss")) body.reasoning_effort = "low";
+
+  const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${GROQ_API_KEY}`,
+    },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const e = new Error(`Groq API ${res.status}: ${await res.text()}`);
+    e.status = res.status;
+    throw e;
+  }
+  const data = await res.json();
+  const content = data.choices?.[0]?.message?.content || "";
+  return content.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
 }
 
 async function callGemini({ model, system, prompt, maxTokens }) {
