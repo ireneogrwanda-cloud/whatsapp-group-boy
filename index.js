@@ -27,20 +27,30 @@ if (!admin.apps.length) {
 const db = admin.firestore();
 
 // ---------- Config ----------
-// Required: add ANTHROPIC_API_KEY as a variable on Railway.
-const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
-if (!ANTHROPIC_API_KEY) {
-  console.error("Missing ANTHROPIC_API_KEY env var.");
+// AI provider: add ONE of these as a variable on Railway.
+//   GEMINI_API_KEY    -> free tier from Google AI Studio (no card needed)
+//   ANTHROPIC_API_KEY -> Claude (paid, needs a card)
+// If both are set, Claude is used.
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || "";
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
+const PROVIDER = ANTHROPIC_API_KEY ? "claude" : GEMINI_API_KEY ? "gemini" : "";
+if (!PROVIDER) {
+  console.error("Missing GEMINI_API_KEY (free) or ANTHROPIC_API_KEY env var.");
   process.exit(1);
 }
+console.log(`AI provider: ${PROVIDER}`);
 
 // Optional: restrict the bot to only respond inside one specific group.
 const ALLOWED_GROUP_JID = process.env.ALLOWED_GROUP_JID || "";
 
 // Models: the main one writes recaps/answers, the fast one only decides
 // "should I jump in on this message?" (cheap, runs on question-like messages).
-const MAIN_MODEL = process.env.MAIN_MODEL || "claude-sonnet-4-6";
-const FAST_MODEL = process.env.FAST_MODEL || "claude-haiku-4-5-20251001";
+const MAIN_MODEL =
+  process.env.MAIN_MODEL ||
+  (PROVIDER === "claude" ? "claude-sonnet-4-6" : "gemini-2.5-flash");
+const FAST_MODEL =
+  process.env.FAST_MODEL ||
+  (PROVIDER === "claude" ? "claude-haiku-4-5-20251001" : "gemini-2.5-flash-lite");
 
 const HISTORY_LIMIT = Number(process.env.HISTORY_LIMIT || 300); // messages sent to Claude
 const HISTORY_HOURS = Number(process.env.HISTORY_HOURS || 48); // ignore older than this
@@ -76,8 +86,42 @@ function isExplicitlyCalled(msg, text, sock) {
   return false;
 }
 
-// ---------- Claude API ----------
-async function callClaude({ model, system, prompt, maxTokens = 800 }) {
+// ---------- AI API (Gemini free tier or Claude) ----------
+async function callAI({ model, system, prompt, maxTokens = 800 }) {
+  return PROVIDER === "gemini"
+    ? callGemini({ model, system, prompt, maxTokens })
+    : callClaudeApi({ model, system, prompt, maxTokens });
+}
+
+async function callGemini({ model, system, prompt, maxTokens }) {
+  const generationConfig = { maxOutputTokens: Math.max(maxTokens, 100) };
+  // Gemini 2.5 models "think" by default, which eats the token budget; turn it off.
+  if (model.includes("2.5")) generationConfig.thinkingConfig = { thinkingBudget: 0 };
+
+  const res = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+    {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-goog-api-key": GEMINI_API_KEY,
+      },
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: system }] },
+        contents: [{ role: "user", parts: [{ text: prompt }] }],
+        generationConfig,
+      }),
+    }
+  );
+  if (!res.ok) {
+    throw new Error(`Gemini API ${res.status}: ${await res.text()}`);
+  }
+  const data = await res.json();
+  const parts = data.candidates?.[0]?.content?.parts || [];
+  return parts.map((p) => p.text || "").join("").trim();
+}
+
+async function callClaudeApi({ model, system, prompt, maxTokens }) {
   const res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
@@ -144,7 +188,7 @@ function formatHistory(rows) {
 // ---------- Decide whether to jump in ----------
 async function shouldRespond(text, senderName, history) {
   const context = formatHistory(history.slice(-8));
-  const answer = await callClaude({
+  const answer = await callAI({
     model: FAST_MODEL,
     maxTokens: 5,
     system:
@@ -170,7 +214,7 @@ async function buildReply(incomingText, senderName, groupId, isRecap) {
     ? `${senderName} wants to be caught up. Summarize what has happened: main topics, decisions made, open questions, and who is doing what. Group by topic, keep it under about 200 words unless the chat was very busy.`
     : `${senderName} asked: "${incomingText}". Answer using only what was said in the chat. If it was not discussed, say you haven't seen it come up.`;
 
-  const reply = await callClaude({
+  const reply = await callAI({
     model: MAIN_MODEL,
     maxTokens: 900,
     system:
