@@ -39,9 +39,18 @@ if (!PROVIDER) {
   process.exit(1);
 }
 console.log(`AI provider: ${PROVIDER}`);
+console.log("Bot version: v4 (answers any question, multi-group)");
 
-// Optional: restrict the bot to only respond inside one specific group.
-const ALLOWED_GROUP_JID = process.env.ALLOWED_GROUP_JID || "";
+// Assign the groups the bot works in: ALLOWED_GROUP_JID = one or more group IDs,
+// separated by commas, e.g. 120363422587335833@g.us,120363408932063696@g.us
+// The bot prints every group it is in (name + ID) when it connects.
+// Leave empty to let it work in every group it is a member of.
+const ALLOWED_GROUPS = new Set(
+  (process.env.ALLOWED_GROUP_JID || "")
+    .split(",")
+    .map((g) => g.trim())
+    .filter(Boolean)
+);
 
 // Models: the main one writes recaps/answers, the fast one only decides
 // "should I jump in on this message?" (cheap, runs on question-like messages).
@@ -208,10 +217,10 @@ async function buildReply(incomingText, senderName, groupId, isRecap, canStaySil
   } else if (canStaySilent) {
     task =
       `${senderName} just wrote this in the group: "${incomingText}"\n\n` +
-      `If it is a genuine question you can help with, answer it. Use the chat history when it is relevant; ` +
+      `Answer it whenever you reasonably can. Use the chat history when it is relevant; ` +
       `otherwise answer briefly from general knowledge (max 3 sentences). ` +
-      `If it is aimed at a specific person, is rhetorical, is a greeting or chit-chat, is about someone's personal plans or feelings that only they can answer, ` +
-      `or you would just be guessing, reply with exactly NO_REPLY and nothing else.`;
+      `Reply with exactly NO_REPLY and nothing else ONLY if the message is clearly directed at one specific person by name, ` +
+      `is a rhetorical question, or is just a greeting or a joke.`;
   } else {
     task = `${senderName} asked: "${incomingText}". Use the chat history when it is relevant; for general questions answer briefly from your own knowledge. If it is about the group's conversation and was not discussed, say you haven't seen it come up.`;
   }
@@ -246,7 +255,10 @@ async function maybeReply(sock, msg, text, groupId) {
 
   const previous = lastAutoReply.get(groupId) || 0;
   if (!called) {
-    if (Date.now() - previous < COOLDOWN_SECONDS * 1000) return;
+    if (Date.now() - previous < COOLDOWN_SECONDS * 1000) {
+      console.log(`[skip] question-like message but cooldown active: "${text.slice(0, 40)}"`);
+      return;
+    }
     lastAutoReply.set(groupId, Date.now()); // claim the slot so parallel messages don't double-reply
   }
 
@@ -255,9 +267,11 @@ async function maybeReply(sock, msg, text, groupId) {
     const replyText = await buildReply(text, senderName, groupId, isRecap, !called);
     if (!replyText) {
       lastAutoReply.set(groupId, previous); // stayed silent, so don't burn the cooldown
+      console.log(`[silent] model chose not to answer: "${text.slice(0, 40)}"`);
       return;
     }
     await sock.sendMessage(groupId, { text: replyText }, { quoted: msg });
+    console.log(`[replied] ${called ? "called" : "auto"}: "${text.slice(0, 40)}"`);
     if (called) await sock.sendPresenceUpdate("paused", groupId).catch(() => {});
   } catch (err) {
     if (!called) lastAutoReply.set(groupId, previous);
@@ -325,6 +339,16 @@ async function startBot() {
       if (shouldReconnect) startBot();
     } else if (connection === "open") {
       console.log("✅ Connected to WhatsApp.");
+      try {
+        const groups = await sock.groupFetchAllParticipating();
+        console.log("Groups this account is in (copy the ID into ALLOWED_GROUP_JID):");
+        for (const g of Object.values(groups)) {
+          const on = !ALLOWED_GROUPS.size || ALLOWED_GROUPS.has(g.id);
+          console.log(`  ${on ? "[ON] " : "[off]"} ${g.subject}  ->  ${g.id}`);
+        }
+      } catch (err) {
+        console.error("Could not list groups:", err?.message || err);
+      }
     }
   });
 
@@ -338,7 +362,7 @@ async function startBot() {
         const remoteJid = msg.key.remoteJid || "";
         const isGroup = remoteJid.endsWith("@g.us");
         if (!isGroup) continue; // ignore 1:1 DMs for this bot
-        if (ALLOWED_GROUP_JID && remoteJid !== ALLOWED_GROUP_JID) continue;
+        if (ALLOWED_GROUPS.size && !ALLOWED_GROUPS.has(remoteJid)) continue;
 
         const sender = msg.key.participant || remoteJid;
         const text =
