@@ -47,10 +47,10 @@ const ALLOWED_GROUP_JID = process.env.ALLOWED_GROUP_JID || "";
 // "should I jump in on this message?" (cheap, runs on question-like messages).
 const MAIN_MODEL =
   process.env.MAIN_MODEL ||
-  (PROVIDER === "claude" ? "claude-sonnet-4-6" : "gemini-2.5-flash");
+  (PROVIDER === "claude" ? "claude-sonnet-4-6" : "gemini-3.6-flash");
 const FAST_MODEL =
   process.env.FAST_MODEL ||
-  (PROVIDER === "claude" ? "claude-haiku-4-5-20251001" : "gemini-2.5-flash-lite");
+  (PROVIDER === "claude" ? "claude-haiku-4-5-20251001" : "gemini-3.6-flash");
 
 const HISTORY_LIMIT = Number(process.env.HISTORY_LIMIT || 300); // messages sent to Claude
 const HISTORY_HOURS = Number(process.env.HISTORY_HOURS || 48); // ignore older than this
@@ -100,7 +100,9 @@ async function callAI({ model, system, prompt, maxTokens = 800 }) {
 }
 
 async function callGemini({ model, system, prompt, maxTokens }) {
-  const generationConfig = { maxOutputTokens: Math.max(maxTokens, 100) };
+  // Newer Gemini models "think" before answering and thinking counts toward the limit,
+  // so leave plenty of room or the reply can come back empty.
+  const generationConfig = { maxOutputTokens: Math.max(maxTokens * 3, 1024) };
   // Gemini 2.5 models "think" by default, which eats the token budget; turn it off.
   if (model.includes("2.5")) generationConfig.thinkingConfig = { thinkingBudget: 0 };
 
