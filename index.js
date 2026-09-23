@@ -39,7 +39,7 @@ if (!PROVIDER) {
   process.exit(1);
 }
 console.log(`AI provider: ${PROVIDER}`);
-console.log("Bot version: v4 (answers any question, multi-group)");
+console.log("Bot version: v6 (quota handling, AUTO_REPLY switch)");
 
 // Assign the groups the bot works in: ALLOWED_GROUP_JID = one or more group IDs,
 // separated by commas, e.g. 120363422587335833@g.us,120363408932063696@g.us
@@ -52,8 +52,41 @@ const ALLOWED_GROUPS = new Set(
     .filter(Boolean)
 );
 
-// Models: the main one writes recaps/answers, the fast one only decides
-// "should I jump in on this message?" (cheap, runs on question-like messages).
+// Groups switched on from inside WhatsApp with "@bot enable" (saved in Firestore,
+// so they survive redeploys). Works together with ALLOWED_GROUP_JID.
+const dynamicGroups = new Set();
+
+// Who may use "@bot enable" / "@bot disable": OWNER_ID = comma-separated numbers.
+// Add your phone number AND/OR the long ID the logs show next to your messages
+// (e.g. 29962480418836). Only digits matter.
+const OWNER_IDS = new Set(
+  (process.env.OWNER_ID || "")
+    .split(",")
+    .map((x) => x.replace(/\D/g, ""))
+    .filter(Boolean)
+);
+
+// Is the bot active in this group?
+// If nothing has been assigned anywhere (no env list, nothing enabled by command),
+// it works in every group it is in.
+function isGroupAllowed(jid) {
+  if (!ALLOWED_GROUPS.size && !dynamicGroups.size) return true;
+  return ALLOWED_GROUPS.has(jid) || dynamicGroups.has(jid);
+}
+
+async function loadDynamicGroups() {
+  try {
+    const doc = await db.collection("bot_settings").doc("groups").get();
+    (doc.data()?.jids || []).forEach((j) => dynamicGroups.add(j));
+    console.log(`Groups enabled by command: ${dynamicGroups.size}`);
+  } catch (err) {
+    console.error("Could not load enabled groups:", err?.message || err);
+  }
+}
+
+// Models: MAIN_MODEL writes recaps and answers when someone calls the bot (tag / "catch me up").
+// FAST_MODEL answers unprompted questions. Free-tier daily quotas are counted per model,
+// so using two different models gives you two separate daily allowances.
 const MAIN_MODEL =
   process.env.MAIN_MODEL ||
   (PROVIDER === "claude" ? "claude-sonnet-4-6" : "gemini-3.6-flash");
@@ -63,6 +96,9 @@ const FAST_MODEL =
 
 const HISTORY_LIMIT = Number(process.env.HISTORY_LIMIT || 300); // messages sent to Claude
 const HISTORY_HOURS = Number(process.env.HISTORY_HOURS || 48); // ignore older than this
+// Set AUTO_REPLY=off in Railway to answer ONLY when the bot is tagged or asked for a recap
+// (saves your free AI quota). Default: on.
+const AUTO_REPLY = (process.env.AUTO_REPLY || "on").toLowerCase() !== "off";
 const COOLDOWN_SECONDS = Number(process.env.COOLDOWN_SECONDS || 45); // between auto-replies
 const TIMEZONE = process.env.TIMEZONE || "Africa/Kigali";
 
@@ -131,7 +167,9 @@ async function callGemini({ model, system, prompt, maxTokens }) {
     }
   );
   if (!res.ok) {
-    throw new Error(`Gemini API ${res.status}: ${await res.text()}`);
+    const e = new Error(`Gemini API ${res.status}: ${await res.text()}`);
+    e.status = res.status;
+    throw e;
   }
   const data = await res.json();
   const parts = data.candidates?.[0]?.content?.parts || [];
@@ -154,7 +192,9 @@ async function callClaudeApi({ model, system, prompt, maxTokens }) {
     }),
   });
   if (!res.ok) {
-    throw new Error(`Anthropic API ${res.status}: ${await res.text()}`);
+    const e = new Error(`Anthropic API ${res.status}: ${await res.text()}`);
+    e.status = res.status;
+    throw e;
   }
   const data = await res.json();
   return (data.content || [])
@@ -226,7 +266,7 @@ async function buildReply(incomingText, senderName, groupId, isRecap, canStaySil
   }
 
   const reply = await callAI({
-    model: MAIN_MODEL,
+    model: canStaySilent ? FAST_MODEL : MAIN_MODEL, // unprompted replies use their own model = their own daily quota
     maxTokens: 900,
     system:
       "You are a friendly, concise assistant living in a WhatsApp group. You can see the group's recent chat history. " +
@@ -251,7 +291,7 @@ async function maybeReply(sock, msg, text, groupId) {
   const called = explicit || isRecap;
 
   // Not called directly: only consider messages that look like questions
-  if (!called && !looksLikeQuestion(text)) return;
+  if (!called && (!AUTO_REPLY || !looksLikeQuestion(text))) return;
 
   const previous = lastAutoReply.get(groupId) || 0;
   if (!called) {
@@ -275,8 +315,74 @@ async function maybeReply(sock, msg, text, groupId) {
     if (called) await sock.sendPresenceUpdate("paused", groupId).catch(() => {});
   } catch (err) {
     if (!called) lastAutoReply.set(groupId, previous);
+    if (err.status === 429) {
+      console.log("[quota] AI free-tier limit reached for now (resets around midnight Pacific).");
+      if (called) {
+        await sock
+          .sendMessage(
+            groupId,
+            { text: "I've hit my free AI limit for now. Please try again a bit later." },
+            { quoted: msg }
+          )
+          .catch(() => {});
+      }
+      return;
+    }
     throw err;
   }
+}
+
+// "@bot enable" / "@bot disable" / "@bot status", typed inside a group.
+// enable and disable are owner-only; status is open to everyone.
+const CMD_REGEX = /^\s*(?:@\S+|hey bot|bot[,:]?)\s+(enable|disable|status)\s*[.!]?\s*$/i;
+
+async function handleAdminCommand(sock, msg, text, groupId, sender) {
+  const m = text.match(CMD_REGEX);
+  if (!m || !isExplicitlyCalled(msg, text, sock)) return false;
+
+  const cmd = m[1].toLowerCase();
+  const say = (t) => sock.sendMessage(groupId, { text: t }, { quoted: msg });
+  const active = isGroupAllowed(groupId);
+
+  if (cmd === "status") {
+    await say(active ? "✅ I'm active in this group." : "⏸️ I'm not active in this group.");
+    return true;
+  }
+
+  const senderId = bareId(sender);
+  if (!OWNER_IDS.has(senderId)) {
+    console.log(`[cmd] "${cmd}" requested by ${sender} in ${groupId}, but they are not an owner. To allow them, add ${senderId} to OWNER_ID.`);
+    if (active) await say("Only the bot owner can do that.");
+    return true;
+  }
+
+  if (cmd === "enable") {
+    await db
+      .collection("bot_settings")
+      .doc("groups")
+      .set({ jids: admin.firestore.FieldValue.arrayUnion(groupId) }, { merge: true });
+    dynamicGroups.add(groupId);
+    console.log(`[cmd] enabled group ${groupId}`);
+    await say(
+      "✅ I'm now active in this group. I'll remember recent messages here so I can catch people up. " +
+        "Tag me, ask a question, or say \"catch me up\". Say \"@bot disable\" to turn me off."
+    );
+    return true;
+  }
+
+  // disable
+  if (ALLOWED_GROUPS.has(groupId)) {
+    await say("This group is fixed in the bot's settings (ALLOWED_GROUP_JID), so it has to be removed there.");
+    return true;
+  }
+  await db
+    .collection("bot_settings")
+    .doc("groups")
+    .set({ jids: admin.firestore.FieldValue.arrayRemove(groupId) }, { merge: true });
+  dynamicGroups.delete(groupId);
+  console.log(`[cmd] disabled group ${groupId}`);
+  await say("Okay, I've stopped tracking this group.");
+  return true;
 }
 
 async function logError(err) {
@@ -343,7 +449,7 @@ async function startBot() {
         const groups = await sock.groupFetchAllParticipating();
         console.log("Groups this account is in (copy the ID into ALLOWED_GROUP_JID):");
         for (const g of Object.values(groups)) {
-          const on = !ALLOWED_GROUPS.size || ALLOWED_GROUPS.has(g.id);
+          const on = isGroupAllowed(g.id);
           console.log(`  ${on ? "[ON] " : "[off]"} ${g.subject}  ->  ${g.id}`);
         }
       } catch (err) {
@@ -362,7 +468,6 @@ async function startBot() {
         const remoteJid = msg.key.remoteJid || "";
         const isGroup = remoteJid.endsWith("@g.us");
         if (!isGroup) continue; // ignore 1:1 DMs for this bot
-        if (ALLOWED_GROUPS.size && !ALLOWED_GROUPS.has(remoteJid)) continue;
 
         const sender = msg.key.participant || remoteJid;
         const text =
@@ -373,6 +478,11 @@ async function startBot() {
           "";
 
         if (!text) continue;
+
+        // Owner commands work in any group, even ones the bot is not active in yet
+        if (await handleAdminCommand(sock, msg, text, remoteJid, sender)) continue;
+
+        if (!isGroupAllowed(remoteJid)) continue;
 
         console.log(`[${remoteJid}] ${sender}: ${text}`);
 
@@ -394,7 +504,7 @@ async function startBot() {
   });
 }
 
-startBot().catch((err) => {
+loadDynamicGroups().then(() => startBot()).catch((err) => {
   console.error("Fatal error starting bot:", err);
   process.exit(1);
 });
