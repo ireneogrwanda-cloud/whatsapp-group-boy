@@ -57,6 +57,12 @@ const HISTORY_HOURS = Number(process.env.HISTORY_HOURS || 48); // ignore older t
 const COOLDOWN_SECONDS = Number(process.env.COOLDOWN_SECONDS || 45); // between auto-replies
 const TIMEZONE = process.env.TIMEZONE || "Africa/Kigali";
 
+// Link WhatsApp with an 8-character pairing code instead of a QR code
+// (QR codes get scrambled by Railway's log timestamps).
+// Set PAIRING_PHONE to the number of the WhatsApp account the bot will use,
+// digits only with country code, e.g. 250788123456
+const PAIRING_PHONE = (process.env.PAIRING_PHONE || "").replace(/\D/g, "");
+
 // Being called directly always gets a reply (skips the AI check and cooldown)
 const TRIGGER_REGEX = /(^|\W)(@bot|hey bot|bot[,:!?])/i;
 
@@ -276,12 +282,30 @@ async function startBot() {
 
   sock.ev.on("creds.update", saveCreds);
 
-  sock.ev.on("connection.update", (update) => {
+  let pairingRequested = false;
+
+  sock.ev.on("connection.update", async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
-      console.log("\nScan this QR code with WhatsApp (Linked Devices):\n");
-      qrcode.generate(qr, { small: true });
+      if (PAIRING_PHONE && !sock.authState.creds.registered) {
+        if (!pairingRequested) {
+          pairingRequested = true;
+          try {
+            const code = await sock.requestPairingCode(PAIRING_PHONE);
+            console.log(`\n>>> PAIRING CODE: ${code} <<<`);
+            console.log(
+              "WhatsApp > Settings > Linked Devices > Link a device > 'Link with phone number instead', then enter the code.\n"
+            );
+          } catch (err) {
+            pairingRequested = false;
+            console.error("Could not get pairing code:", err);
+          }
+        }
+      } else {
+        console.log("\nScan this QR code with WhatsApp (Linked Devices):\n");
+        qrcode.generate(qr, { small: true });
+      }
     }
 
     if (connection === "close") {
