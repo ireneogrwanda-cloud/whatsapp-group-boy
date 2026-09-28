@@ -1315,6 +1315,7 @@ async function startBot() {
   sock.ev.on("creds.update", saveCreds);
 
   let pairingRequested = false;
+  let qrHintShown = false;
 
   sock.ev.on("connection.update", async (update) => {
     const { connection, lastDisconnect, qr } = update;
@@ -1334,9 +1335,15 @@ async function startBot() {
             console.error("Could not get pairing code:", err);
           }
         }
-      } else {
+      } else if (process.env.SHOW_QR === "on") {
         console.log("\nScan this QR code with WhatsApp (Linked Devices):\n");
         qrcode.generate(qr, { small: true });
+      } else if (!qrHintShown) {
+        qrHintShown = true;
+        console.log(
+          "\n>>> NOT LINKED TO WHATSAPP YET. Add a Railway variable named PAIRING_PHONE with the bot's phone number " +
+            "(digits only, with country code, e.g. 250788123456), then redeploy to get an 8-character pairing code here. <<<\n"
+        );
       }
     }
 
